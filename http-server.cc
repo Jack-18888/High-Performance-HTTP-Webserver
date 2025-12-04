@@ -1,44 +1,68 @@
 #include "http-server.h"
-#include <algorithm>
-#include <arpa/inet.h>
-#include <asm-generic/socket.h>
-#include <errno.h>
-#include <sched.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/resource.h>
-#include <sys/time.h>
-#include <sys/uio.h>
 
-#define BUFFER_SIZE 1024
 #define MAX_REQUEST_SIZE 65536
 
-// const int buffer_size = 1024;
-
-void pin_to_cpu_core(int core_id) {
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    CPU_SET(core_id, &mask);
-    if (sched_setaffinity(0, sizeof(cpu_set_t), &mask) == -1) {
-        perror("sched_setaffinity");
-    }
+int set_non_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1)
+        return flags;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-void set_priority(int priority) {
-    int result = setpriority(PRIO_PROCESS, 0, priority);
+// Robust, line-based header search using string_view (Zero Copy)
+std::string_view get_header_value(std::string_view headers, std::string_view name) {
+    size_t pos = 0;
+    size_t len = headers.length();
 
-    if (result == -1) {
-        perror("Failed to set priority"); // Print error message if setpriority fails
-        // Check errno for specific error details
-        if (errno == EACCES) {
-            fprintf(stderr, "Permission denied: You likely need root privileges to set such a high priority.\n");
-        } else if (errno == EINVAL) {
-            fprintf(stderr, "Invalid priority value: The system might not support -20.\n");
+    while (pos < len) {
+        size_t end = headers.find("\r\n", pos);
+        if (end == std::string_view::npos)
+            break;
+
+        // We have a line from pos to end
+        // Check if it starts with 'name' (case insensitive)
+        if (end - pos >= name.length()) {
+            bool match = true;
+            for (size_t i = 0; i < name.length(); ++i) {
+                if (std::tolower(headers[pos + i]) != std::tolower(name[i])) {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match) {
+                size_t colon_idx = pos + name.length();
+                if (colon_idx < end && headers[colon_idx] == ':') {
+                    // Found the header! Extract value
+                    size_t val_start = colon_idx + 1;
+                    // Skip leading whitespace
+                    while (val_start < end && (headers[val_start] == ' ' || headers[val_start] == '\t')) {
+                        val_start++;
+                    }
+                    return headers.substr(val_start, end - val_start);
+                }
+            }
         }
-        exit(1); // Indicate an error
-    } else {
-        printf("Priority set to highest possible (-20 nice value).\n");
+
+        pos = end + 2; // Move to next line (skip \r\n)
     }
+    return ""; // Returns empty string_view
+}
+
+bool body_contains_chunked_terminator(std::string_view msg, size_t header_end) {
+    // Check for 0\r\n\r\n inside the body part of the message.
+    if (msg.size() < header_end)
+        return false;
+
+    // Case 1: The body is JUST 0\r\n\r\n (empty chunked body)
+    if (msg.size() >= header_end + 5) {
+        // Use string_view comparison
+        if (msg.substr(header_end, 5) == "0\r\n\r\n")
+            return true;
+    }
+
+    // Case 2: Standard chunked body ending with ...\r\n0\r\n\r\n
+    return msg.find("\r\n0\r\n\r\n", header_end) != std::string_view::npos;
 }
 
 // Helper function to reliably read an exact number of bytes
@@ -108,86 +132,6 @@ struct HTTPRequest parse_http_request(const std::string &request) {
     return req;
 }
 
-// Function to read chunked request body
-void read_request_body_chunked(int client_socket, std::string &request_buffer, const std::string &pre_read_body) {
-    request_buffer.append(pre_read_body);
-
-    while (true) {
-        std::string size_line;
-        char c;
-        while (read_exact_bytes(client_socket, &c, 1) && (c != '\r')) {
-            size_line += c;
-        }
-        if (!read_exact_bytes(client_socket, &c, 1) || c != '\n') {
-            // Protocol violation or connection error
-            return;
-        }
-
-        // Convert hex string to size_t
-        size_t chunk_size = 0;
-        try {
-            chunk_size = std::stoul(size_line, nullptr, 16);
-        } catch (...) {
-            // Invalid chunk size format
-            return;
-        }
-
-        if (chunk_size == 0) {
-            // Read the final trailing \r\n after the 0-size chunk
-            char crlf[2];
-            read_exact_bytes(client_socket, crlf, 2);
-            break;
-        }
-
-        // Read the chunk data
-        char *chunk_data = new char[chunk_size];
-        if (read_exact_bytes(client_socket, chunk_data, chunk_size)) {
-            request_buffer.append(chunk_data, chunk_size);
-        }
-        delete[] chunk_data;
-
-        // Read the trailing \r\n after the chunk data
-        char crlf[2];
-        read_exact_bytes(client_socket, crlf, 2);
-    }
-}
-
-// Function to read request body based on Content-Length
-void read_request_body(int client_socket, std::string &request_buffer, size_t content_length,
-                       const std::string &pre_read_body) {
-
-    // 1. Account for pre-read body data
-    request_buffer.append(pre_read_body);
-
-    size_t body_already_received = pre_read_body.length();
-
-    // If we've already received the whole body (or more), we're done.
-    if (body_already_received >= content_length) {
-        return;
-    }
-
-    size_t remaining_to_read = content_length - body_already_received;
-
-    // 2. Loop to read the remaining data
-    while (remaining_to_read > 0) {
-        // Buffer must be dynamic or large enough
-        char temp_buffer[BUFFER_SIZE];
-
-        // Read up to BUFFER_SIZE or the remaining amount
-        size_t bytes_to_read = std::min((size_t)BUFFER_SIZE, remaining_to_read);
-
-        ssize_t bytes_received = recv(client_socket, temp_buffer, bytes_to_read, 0);
-
-        if (bytes_received <= 0) {
-            // Connection closed before full Content-Length was received
-            break;
-        }
-
-        request_buffer.append(temp_buffer, bytes_received);
-        remaining_to_read -= bytes_received;
-    }
-}
-
 void HttpServer::create_socket() {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == 0) {
@@ -211,6 +155,12 @@ void HttpServer::config_socket_opt() {
     // if (setsockopt(server_fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
     //     perror("setsockopt SO_RCVBUF failed");
     // }
+
+    // Set socket to non-blocking mode
+    if (set_non_blocking(server_fd) == -1) {
+        perror("set_non_blocking failed");
+        exit(EXIT_FAILURE);
+    }
 }
 
 void HttpServer::bind_socket(struct sockaddr_in &address) {
@@ -227,6 +177,23 @@ void HttpServer::bind_socket(struct sockaddr_in &address) {
 void HttpServer::listen_socket() {
     if (listen(server_fd, 1024) < 0) {
         perror("listen");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void HttpServer::setup_epoll() {
+    epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        perror("epoll_create1");
+        exit(EXIT_FAILURE);
+    }
+
+    struct epoll_event event;
+    event.events = EPOLLIN;
+    event.data.fd = server_fd;
+
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) == -1) {
+        perror("epoll_ctl: server_fd");
         exit(EXIT_FAILURE);
     }
 }
@@ -249,106 +216,166 @@ std::string HttpServer::get_response(const std::string &request) {
     return response;
 }
 
-std::string HttpServer::read_full_request(int client_socket) {
-    char temp_buffer[BUFFER_SIZE];
-    std::string request_buffer;
-
-    const char *end_delimiter = "\r\n\r\n";
-    size_t delimiter_len = 4;
-
-    size_t old_size = 0; // Tracks size *before* new append
-
-    // Read until delimeter found or max size reached
-    while (request_buffer.size() < MAX_REQUEST_SIZE) {
-
-        // Calculate the maximum number of bytes we can still read
-        size_t bytes_to_read = std::min((size_t)BUFFER_SIZE, MAX_REQUEST_SIZE - request_buffer.size());
-
-        ssize_t bytes_received = recv(client_socket, temp_buffer, bytes_to_read, 0);
-
-        if (bytes_received <= 0) {
-            return request_buffer;
-        }
-
-        old_size = request_buffer.size(); // Store size before append
-
-        request_buffer.append(temp_buffer, bytes_received);
-
-        if (request_buffer.size() >= delimiter_len) {
-            size_t search_start_idx = 0;
-            if (old_size >= delimiter_len - 1) {
-                search_start_idx = old_size - (delimiter_len - 1);
-            }
-
-            size_t delimiter_pos = request_buffer.find(end_delimiter, search_start_idx);
-
-            if (delimiter_pos != std::string::npos) {
-                break;
-            }
-        }
-    }
-
-    if (request_buffer.size() >= MAX_REQUEST_SIZE) {
-        return request_buffer;
-    }
-
-    size_t delimiter_pos = request_buffer.find(end_delimiter); // Safe now, since we know it exists
-    std::string headers_only = request_buffer.substr(0, delimiter_pos);
-
-    std::string pre_read_body_data = request_buffer.substr(delimiter_pos + delimiter_len);
-
-    request_buffer.resize(delimiter_pos + delimiter_len);
-
-    // Check Transfer-Encoding
-    std::string te_value = get_header_value(headers_only, "transfer-encoding");
-    if (te_value.find("chunked") != std::string::npos) {
-
-        read_request_body_chunked(client_socket, request_buffer, pre_read_body_data);
-
-    } else {
-        // Check Content-Length
-        std::string cl_str = get_header_value(headers_only, "content-length");
-        if (!cl_str.empty()) {
-            size_t content_length = 0;
-            try {
-                content_length = std::stoul(cl_str);
-            } catch (...) {
-                return request_buffer;
-            }
-
-            read_request_body(client_socket, request_buffer, content_length, pre_read_body_data);
-
-        } else {
-            // Neither Content-Length nor chunked: request is complete (no body expected)
-        }
-    }
-
-    // Return the full request (Headers + Body)
-    return request_buffer;
-}
-
 void HttpServer::main_loop(struct sockaddr_in *address, socklen_t *addrlen) {
-    while (running) {
-        int client_socket;
-        if ((client_socket = accept(server_fd, (struct sockaddr *)address, addrlen)) < 0) {
-            perror("accept");
-            continue; // Continue the loop to try accepting the next connection
-        }
+    std::unordered_map<int, ActiveConnData> client_connections;
+    while (true) {
+        int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
-        char buffer[1024] = {0};
-        ssize_t bytes_received = recv(client_socket, buffer, 1024, 0);
-        std::string request, response;
-        if (bytes_received > 0) {
-            request = std::string(buffer, bytes_received);
-            response = get_response(request);
-        }
+        for (int i = 0; i < num_events; i++) {
+            int current_fd = events[i].data.fd;
 
-        ssize_t bytes_sent = send(client_socket, response.c_str(), response.size(), 0);
-        if (bytes_sent == -1) {
-            perror("send failed");
-        }
+            if (current_fd == server_fd) {
+                // --- server_fd has new connection requests ---
+                while (true) {
+                    struct sockaddr_in client_addr;
+                    socklen_t addrlen = sizeof(client_addr);
+                    int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
 
-        close(client_socket);
+                    if (client_fd < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break; // No more new connections
+                        } else {
+                            perror("accept");
+                            break;
+                        }
+                    }
+
+                    // Add connection to epoll
+                    set_non_blocking(client_fd);
+                    struct epoll_event client_event;
+                    client_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                    client_event.data.fd = client_fd;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event);
+
+                    // Initialize state
+                    client_connections[client_fd] = ActiveConnData();
+                }
+            } else {
+                // --- event is from a client_fd ---
+                int client_fd = current_fd;
+
+                ActiveConnData &active_data = client_connections[client_fd];
+
+                ssize_t total_read = 0;
+                char buffer[BUFFER_SIZE];
+                bool close_conn = false;
+
+                // Keep reading from client_fd until bytes_read indicates wait or close
+                while (true) {
+                    ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer), 0);
+
+                    if (bytes_read > 0) {
+                        active_data.msg.append(buffer, bytes_read);
+                        total_read += bytes_read;
+                    } else if (bytes_read == 0) {
+                        // Client closed connection
+                        close_conn = true;
+                        break;
+                    } else {
+                        // bytes_read < 0
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            // No more data to read now
+                            break;
+                        } else {
+                            // Socket error
+                            perror("recv error");
+                            close_conn = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (close_conn) {
+                    close(client_fd);
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                    client_connections.erase(client_fd);
+                    continue; // Continue to next event
+                }
+
+                // --- Parsing and State Check ---
+
+                // State 1: Header UNKNOWN
+                if (active_data.req_type == UNKNOWN) {
+                    size_t header_pos = active_data.msg.find("\r\n\r\n");
+
+                    if (header_pos != std::string::npos) {
+                        active_data.header_end_pos = header_pos + 4;
+
+                        // Create a string_view window over the existing msg buffer.
+                        std::string_view headers = std::string_view(active_data.msg).substr(0, header_pos + 2);
+
+                        std::string_view te = get_header_value(headers, "Transfer-Encoding");
+                        std::string_view cl = get_header_value(headers, "Content-Length");
+
+                        if (te.find("chunked") != std::string_view::npos) {
+                            active_data.req_type = CHUNKED;
+                        } else if (!cl.empty()) {
+                            active_data.req_type = CONTENT_LENGTH;
+                            active_data.content_length = std::stoul(std::string(cl));
+
+                            // OPTIMIZATION 2: Reserve memory for the full expected body
+                            // We know exactly how much space we need (Headers + Body).
+                            // This ensures only 1 reallocation happens for the rest of the connection.
+                            try {
+                                size_t total_expected = active_data.header_end_pos + active_data.content_length;
+                                // Simple sanity check to prevent malicious 100GB allocation attempts
+                                if (total_expected < 100 * 1024 * 1024) {
+                                    active_data.msg.reserve(total_expected);
+                                }
+                            } catch (...) {
+                                // Allocation failed, we can try to proceed with default growth or close
+                            }
+                        } else {
+                            active_data.req_type = NO_BODY;
+                        }
+                    } else {
+                        // Header incomplete, wait for next event
+                        struct epoll_event mod_event;
+                        mod_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                        mod_event.data.fd = client_fd;
+                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &mod_event);
+                        continue;
+                    }
+                }
+
+                bool request_is_complete = false;
+
+                // State 2 & 3: Body Check
+                if (active_data.req_type == CONTENT_LENGTH) {
+                    if (active_data.msg.size() >= active_data.header_end_pos + active_data.content_length) {
+                        request_is_complete = true;
+                    }
+                } else if (active_data.req_type == CHUNKED) {
+                    // Pass the string view of the message to avoid copying
+                    if (body_contains_chunked_terminator(active_data.msg, active_data.header_end_pos)) {
+                        request_is_complete = true;
+                    }
+                } else if (active_data.req_type == NO_BODY) {
+                    request_is_complete = true;
+                }
+
+                // --- Complete Request Handling (using writev for zero-copy) ---
+                if (request_is_complete) {
+                    std::string response = get_response(active_data.msg);
+                    size_t sent = write(client_fd, response.c_str(), response.size());
+
+                    if (sent == -1) {
+                        perror("writev error");
+                    }
+
+                    // Cleanup
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
+                    close(client_fd);
+                    client_connections.erase(client_fd);
+                } else {
+                    // Re-arm for next data chunk
+                    struct epoll_event mod_event;
+                    mod_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                    mod_event.data.fd = client_fd;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &mod_event);
+                }
+            }
+        }
     }
 }
 
@@ -362,6 +389,8 @@ void HttpServer::start() {
     config_socket_opt();
     bind_socket(address);
     listen_socket();
+
+    setup_epoll();
 
     running = true;
 
