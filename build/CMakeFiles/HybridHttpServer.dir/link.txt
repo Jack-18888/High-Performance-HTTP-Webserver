@@ -1,0 +1,1 @@
+/usr/bin/c++  -O3 -march=native -Wall -Wextra CMakeFiles/HybridHttpServer.dir/main.cc.o "CMakeFiles/HybridHttpServer.dir/thread-pool.cc.o" "CMakeFiles/HybridHttpServer.dir/http-server.cc.o" -o bin/HybridHttpServer 

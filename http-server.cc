@@ -1,7 +1,23 @@
 #include "http-server.h"
+#include <algorithm>
+#include <arpa/inet.h>
+#include <cctype>
+#include <chrono> // For std::this_thread::sleep_for
+#include <errno.h>
+#include <fcntl.h>
+#include <iostream>
+#include <stdexcept>
+#include <string.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-#define MAX_REQUEST_SIZE 65536
+// --- Utility Functions ---
 
+/**
+ * @brief Sets a file descriptor to non-blocking mode.
+ * NOTE: Only used for the listening socket in this TPC model.
+ */
 int set_non_blocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1)
@@ -9,82 +25,14 @@ int set_non_blocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// Robust, line-based header search using string_view (Zero Copy)
-std::string_view get_header_value(std::string_view headers, std::string_view name) {
-    size_t pos = 0;
-    size_t len = headers.length();
-
-    while (pos < len) {
-        size_t end = headers.find("\r\n", pos);
-        if (end == std::string_view::npos)
-            break;
-
-        // We have a line from pos to end
-        // Check if it starts with 'name' (case insensitive)
-        if (end - pos >= name.length()) {
-            bool match = true;
-            for (size_t i = 0; i < name.length(); ++i) {
-                if (std::tolower(headers[pos + i]) != std::tolower(name[i])) {
-                    match = false;
-                    break;
-                }
-            }
-
-            if (match) {
-                size_t colon_idx = pos + name.length();
-                if (colon_idx < end && headers[colon_idx] == ':') {
-                    // Found the header! Extract value
-                    size_t val_start = colon_idx + 1;
-                    // Skip leading whitespace
-                    while (val_start < end && (headers[val_start] == ' ' || headers[val_start] == '\t')) {
-                        val_start++;
-                    }
-                    return headers.substr(val_start, end - val_start);
-                }
-            }
-        }
-
-        pos = end + 2; // Move to next line (skip \r\n)
-    }
-    return ""; // Returns empty string_view
-}
-
-bool body_contains_chunked_terminator(std::string_view msg, size_t header_end) {
-    // Check for 0\r\n\r\n inside the body part of the message.
-    if (msg.size() < header_end)
-        return false;
-
-    // Case 1: The body is JUST 0\r\n\r\n (empty chunked body)
-    if (msg.size() >= header_end + 5) {
-        // Use string_view comparison
-        if (msg.substr(header_end, 5) == "0\r\n\r\n")
-            return true;
-    }
-
-    // Case 2: Standard chunked body ending with ...\r\n0\r\n\r\n
-    return msg.find("\r\n0\r\n\r\n", header_end) != std::string_view::npos;
-}
-
-// Helper function to reliably read an exact number of bytes
-bool read_exact_bytes(int client_socket, char *buffer, size_t count) {
-    size_t total_received = 0;
-    while (total_received < count) {
-        ssize_t bytes_received = recv(client_socket, buffer + total_received, count - total_received, 0);
-        if (bytes_received <= 0) {
-            // Error or connection closed unexpectedly
-            return false;
-        }
-        total_received += bytes_received;
-    }
-    return true;
-}
-
-// Helper function to find a header value (case-insensitive)
+/**
+ * @brief Extracts a header value (case-insensitive search).
+ */
 std::string get_header_value(const std::string &headers, const std::string &name) {
     std::string search_name = name;
     std::transform(search_name.begin(), search_name.end(), search_name.begin(), ::tolower);
+    search_name += ":";
 
-    // Look for the header (e.g., "content-length:")
     size_t pos = headers.find(search_name);
     if (pos == std::string::npos) {
         return "";
@@ -92,19 +40,10 @@ std::string get_header_value(const std::string &headers, const std::string &name
 
     size_t start = pos + search_name.length();
 
-    // Find the colon, case-insensitively, which should be right after the header name
-    size_t colon_pos = headers.find(':', start - 1);
-    if (colon_pos == std::string::npos) {
-        return "";
-    }
-
-    // Find the start of the value (skip optional whitespace after ':')
-    start = colon_pos + 1;
     while (start < headers.length() && (headers[start] == ' ' || headers[start] == '\t')) {
         start++;
     }
 
-    // Find the end of the line (CRLF)
     size_t end = headers.find("\r\n", start);
     if (end == std::string::npos) {
         return "";
@@ -113,17 +52,28 @@ std::string get_header_value(const std::string &headers, const std::string &name
     return headers.substr(start, end - start);
 }
 
-// Helper function to parse the HTTP request line
-struct HTTPRequest parse_http_request(const std::string &request) {
+// Parses the initial request line and body.
+HTTPRequest parse_http_request(const std::string &request) {
     HTTPRequest req;
-    size_t method_end = request.find(' ');
-    size_t path_end = request.find(' ', method_end + 1);
-    size_t version_end = request.find("\r\n", path_end + 1);
+    size_t line_end = request.find("\r\n");
+    if (line_end == std::string::npos)
+        return req;
 
-    req.method = request.substr(0, method_end);
-    req.path = request.substr(method_end + 1, path_end - method_end - 1);
-    req.version = request.substr(path_end + 1, version_end - path_end - 1);
+    std::string first_line = request.substr(0, line_end);
 
+    // 1. Parse Method, Path, Version
+    size_t method_end = first_line.find(' ');
+    if (method_end != std::string::npos) {
+        req.method = first_line.substr(0, method_end);
+
+        size_t path_end = first_line.find(' ', method_end + 1);
+        if (path_end != std::string::npos) {
+            req.path = first_line.substr(method_end + 1, path_end - method_end - 1);
+            req.version = first_line.substr(path_end + 1);
+        }
+    }
+
+    // Parse Body
     size_t body_start = request.find("\r\n\r\n");
     if (body_start != std::string::npos) {
         req.body = request.substr(body_start + 4);
@@ -132,33 +82,42 @@ struct HTTPRequest parse_http_request(const std::string &request) {
     return req;
 }
 
+// --- HttpServer Core Implementation ---
+
+HttpServer::HttpServer(int p, size_t num_threads) : port(p) {
+    // Initialize the Thread Pool
+    thread_pool = new ThreadPool(num_threads);
+}
+
+HttpServer::~HttpServer() {
+    stop();
+    if (thread_pool) {
+        delete thread_pool;
+        thread_pool = nullptr;
+    }
+    if (epoll_fd != -1) {
+        close(epoll_fd);
+    }
+}
+
 void HttpServer::create_socket() {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == 0) {
-        perror("socket failed");
+    if (server_fd == -1) {
+        perror("Socket creation failed");
         exit(EXIT_FAILURE);
     }
 }
 
 void HttpServer::config_socket_opt() {
     int opt = 1;
-
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt))) {
-        perror("setsockopt");
+    // SO_REUSEADDR allows the socket to be bound to a port that is already in use
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt failed");
         exit(EXIT_FAILURE);
     }
-
-    // if (setsockopt(server_fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) < 0) {
-    //     perror("setsockopt SO_SNDBUF failed");
-    // }
-    //
-    // if (setsockopt(server_fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
-    //     perror("setsockopt SO_RCVBUF failed");
-    // }
-
-    // Set socket to non-blocking mode
+    // The main listening socket MUST be non-blocking for epoll accept loop
     if (set_non_blocking(server_fd) == -1) {
-        perror("set_non_blocking failed");
+        perror("set_non_blocking failed for server_fd");
         exit(EXIT_FAILURE);
     }
 }
@@ -169,210 +128,200 @@ void HttpServer::bind_socket(struct sockaddr_in &address) {
     address.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("bind failed");
+        perror("Bind failed");
         exit(EXIT_FAILURE);
     }
 }
 
 void HttpServer::listen_socket() {
     if (listen(server_fd, 1024) < 0) {
-        perror("listen");
+        perror("Listen failed");
         exit(EXIT_FAILURE);
     }
+    std::cout << "Server listening on port " << port << std::endl;
 }
 
 void HttpServer::setup_epoll() {
+    // Create the epoll instance
     epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
-        perror("epoll_create1");
+        perror("epoll_create1 failed");
         exit(EXIT_FAILURE);
     }
 
+    // Register the listening socket with epoll
     struct epoll_event event;
-    event.events = EPOLLIN;
+    event.events = EPOLLIN; // Monitor for input events (new connections)
     event.data.fd = server_fd;
 
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) == -1) {
-        perror("epoll_ctl: server_fd");
+        perror("epoll_ctl: server_fd failed");
         exit(EXIT_FAILURE);
     }
 }
 
-std::string HttpServer::get_response(const std::string &request) {
-    // Placeholder for processing the request and generating a response
-    HTTPRequest http_request = parse_http_request(request);
-    std::string response = "HTTP/1.1 404 Not Found\r\n"
-                           "Content-Type: text/plain\r\n"
-                           "Content-Length: 13\r\n"
-                           "\r\n"
-                           "404 Not Found";
-    for (const auto &route : routes) {
-        if (route.method == http_request.method && route.path == http_request.path) {
-            response = route.handler(http_request.method, http_request.path);
+/**
+ * @brief Reads the entire request from the socket using a blocking loop.
+ * This function is run by a single worker thread.
+ * NOTE: This is slightly simplified to read headers and body sequentially.
+ */
+std::string HttpServer::read_full_request_blocking(int client_fd) {
+    std::string request_buffer;
+    request_buffer.reserve(BUFFER_SIZE); // Reserve initial space
+    char temp_buffer[BUFFER_SIZE];
+    const char *end_delimiter = "\r\n\r\n";
+    size_t delimiter_len = 4;
+    size_t content_length = 0;
+    bool headers_complete = false;
+
+    // Phase 1: Read Headers until "\r\n\r\n" is found
+    while (request_buffer.size() < MAX_REQUEST_SIZE) {
+        // Use blocking recv(). The worker thread will block here,
+        // but the other workers and main thread are free.
+        ssize_t bytes_received = recv(client_fd, temp_buffer, BUFFER_SIZE, 0);
+
+        if (bytes_received <= 0) {
+            return ""; // Connection error or closed
+        }
+
+        request_buffer.append(temp_buffer, bytes_received);
+
+        if (!headers_complete) {
+            size_t header_pos = request_buffer.find(end_delimiter);
+            if (header_pos != std::string::npos) {
+                headers_complete = true;
+
+                std::string headers_only = request_buffer.substr(0, header_pos);
+                std::string cl_str = get_header_value(headers_only, "Content-Length");
+
+                if (!cl_str.empty()) {
+                    try {
+                        content_length = std::stoul(cl_str);
+                    } catch (...) {
+                        // Ignore malformed CL, treat as 0 or close later
+                    }
+                }
+
+                // If headers are complete and Content-Length is non-zero, proceed to body reading
+                if (content_length > 0)
+                    break;
+            }
+        }
+
+        // If headers are complete but no body expected (GET/HEAD), break
+        if (headers_complete && content_length == 0)
             break;
+    }
+
+    // Phase 2: Read Body (only if Content-Length was found and is non-zero)
+    if (content_length > 0) {
+        size_t header_end_pos = request_buffer.find(end_delimiter) + delimiter_len;
+        size_t body_already_received = request_buffer.size() - header_end_pos;
+        size_t remaining_to_read = content_length > body_already_received ? content_length - body_already_received : 0;
+
+        while (remaining_to_read > 0) {
+            ssize_t bytes_to_read = std::min((size_t)BUFFER_SIZE, remaining_to_read);
+            ssize_t bytes_received = recv(client_fd, temp_buffer, bytes_to_read, 0);
+
+            if (bytes_received <= 0) {
+                return ""; // Connection closed before full body received
+            }
+
+            request_buffer.append(temp_buffer, bytes_received);
+            remaining_to_read -= bytes_received;
         }
     }
 
-    return response;
+    return request_buffer;
 }
 
+std::string HttpServer::get_response(const std::string &request) {
+    // Find matching handler and generate response
+    HTTPRequest http_request = parse_http_request(request);
+
+    std::string default_response =
+        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\n404 Not Found";
+
+    for (const auto &route : routes) {
+        if (route.method == http_request.method && route.path == http_request.path) {
+            return route.handler(http_request.method, http_request.path);
+        }
+    }
+
+    return default_response;
+}
+
+/**
+ * @brief The worker task: executes the full blocking I/O cycle for one client.
+ * This is the task that gets delegated to the ThreadPool.
+ */
+void HttpServer::handle_client_blocking(int client_fd) {
+    // 1. Read the full request (BLOCKING I/O - the worker thread is tied up here)
+    std::string request = read_full_request_blocking(client_fd);
+
+    if (!request.empty()) {
+        // 2. Process request (BLOCKING CPU/DELAY)
+        std::string response = get_response(request);
+
+        // 3. Send response (BLOCKING I/O)
+        ssize_t bytes_sent = send(client_fd, response.c_str(), response.size(), 0);
+        if (bytes_sent == -1) {
+            // Log error, but don't crash the server
+            perror("send failed in worker");
+        }
+    } else {
+        // Handle case where client disconnected before sending full request
+    }
+
+    // 4. Cleanup and close
+    close(client_fd);
+}
+
+/**
+ * @brief The main server loop uses epoll only to accept connections and dispatch tasks.
+ * This loop MUST remain non-blocking.
+ */
 void HttpServer::main_loop(struct sockaddr_in *address, socklen_t *addrlen) {
-    std::unordered_map<int, ActiveConnData> client_connections;
-    while (true) {
-        int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+    while (running) {
+        // Wait for events (blocks until an event occurs or timeout)
+        int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, 100); // 100ms timeout to check 'running' flag
+
+        if (num_events < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("epoll_wait failed");
+            break;
+        }
 
         for (int i = 0; i < num_events; i++) {
             int current_fd = events[i].data.fd;
 
             if (current_fd == server_fd) {
-                // --- server_fd has new connection requests ---
+                // Event on listening socket: new connection
                 while (true) {
                     struct sockaddr_in client_addr;
-                    socklen_t addrlen = sizeof(client_addr);
-                    int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
+                    socklen_t addrlen_temp = sizeof(client_addr);
+
+                    // accept is non-blocking because server_fd is non-blocking
+                    int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen_temp);
 
                     if (client_fd < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break; // No more new connections
+                            break; // No more new connections to accept
                         } else {
-                            perror("accept");
+                            perror("accept error");
                             break;
                         }
                     }
 
-                    // Add connection to epoll
-                    set_non_blocking(client_fd);
-                    struct epoll_event client_event;
-                    client_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-                    client_event.data.fd = client_fd;
-                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_event);
-
-                    // Initialize state
-                    client_connections[client_fd] = ActiveConnData();
-                }
-            } else {
-                // --- event is from a client_fd ---
-                int client_fd = current_fd;
-
-                ActiveConnData &active_data = client_connections[client_fd];
-
-                ssize_t total_read = 0;
-                char buffer[BUFFER_SIZE];
-                bool close_conn = false;
-
-                // Keep reading from client_fd until bytes_read indicates wait or close
-                while (true) {
-                    ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer), 0);
-
-                    if (bytes_read > 0) {
-                        active_data.msg.append(buffer, bytes_read);
-                        total_read += bytes_read;
-                    } else if (bytes_read == 0) {
-                        // Client closed connection
-                        close_conn = true;
-                        break;
-                    } else {
-                        // bytes_read < 0
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            // No more data to read now
-                            break;
-                        } else {
-                            // Socket error
-                            perror("recv error");
-                            close_conn = true;
-                            break;
-                        }
+                    // CRITICAL STEP: Delegate the full connection handling to the thread pool
+                    try {
+                        // The lambda captures 'this' to call the member function, and client_fd by value
+                        thread_pool->enqueue(&HttpServer::handle_client_blocking, this, client_fd);
+                    } catch (const std::exception &e) {
+                        std::cerr << "Error enqueueing task: " << e.what() << std::endl;
+                        close(client_fd); // Close socket if task fails to queue
                     }
-                }
-
-                if (close_conn) {
-                    close(client_fd);
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
-                    client_connections.erase(client_fd);
-                    continue; // Continue to next event
-                }
-
-                // --- Parsing and State Check ---
-
-                // State 1: Header UNKNOWN
-                if (active_data.req_type == UNKNOWN) {
-                    size_t header_pos = active_data.msg.find("\r\n\r\n");
-
-                    if (header_pos != std::string::npos) {
-                        active_data.header_end_pos = header_pos + 4;
-
-                        // Create a string_view window over the existing msg buffer.
-                        std::string_view headers = std::string_view(active_data.msg).substr(0, header_pos + 2);
-
-                        std::string_view te = get_header_value(headers, "Transfer-Encoding");
-                        std::string_view cl = get_header_value(headers, "Content-Length");
-
-                        if (te.find("chunked") != std::string_view::npos) {
-                            active_data.req_type = CHUNKED;
-                        } else if (!cl.empty()) {
-                            active_data.req_type = CONTENT_LENGTH;
-                            active_data.content_length = std::stoul(std::string(cl));
-
-                            // OPTIMIZATION 2: Reserve memory for the full expected body
-                            // We know exactly how much space we need (Headers + Body).
-                            // This ensures only 1 reallocation happens for the rest of the connection.
-                            try {
-                                size_t total_expected = active_data.header_end_pos + active_data.content_length;
-                                // Simple sanity check to prevent malicious 100GB allocation attempts
-                                if (total_expected < 100 * 1024 * 1024) {
-                                    active_data.msg.reserve(total_expected);
-                                }
-                            } catch (...) {
-                                // Allocation failed, we can try to proceed with default growth or close
-                            }
-                        } else {
-                            active_data.req_type = NO_BODY;
-                        }
-                    } else {
-                        // Header incomplete, wait for next event
-                        struct epoll_event mod_event;
-                        mod_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-                        mod_event.data.fd = client_fd;
-                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &mod_event);
-                        continue;
-                    }
-                }
-
-                bool request_is_complete = false;
-
-                // State 2 & 3: Body Check
-                if (active_data.req_type == CONTENT_LENGTH) {
-                    if (active_data.msg.size() >= active_data.header_end_pos + active_data.content_length) {
-                        request_is_complete = true;
-                    }
-                } else if (active_data.req_type == CHUNKED) {
-                    // Pass the string view of the message to avoid copying
-                    if (body_contains_chunked_terminator(active_data.msg, active_data.header_end_pos)) {
-                        request_is_complete = true;
-                    }
-                } else if (active_data.req_type == NO_BODY) {
-                    request_is_complete = true;
-                }
-
-                // --- Complete Request Handling (using writev for zero-copy) ---
-                if (request_is_complete) {
-                    std::string response = get_response(active_data.msg);
-                    size_t sent = write(client_fd, response.c_str(), response.size());
-
-                    if (sent == -1) {
-                        perror("writev error");
-                    }
-
-                    // Cleanup
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
-                    close(client_fd);
-                    client_connections.erase(client_fd);
-                } else {
-                    // Re-arm for next data chunk
-                    struct epoll_event mod_event;
-                    mod_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-                    mod_event.data.fd = client_fd;
-                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_fd, &mod_event);
                 }
             }
         }
@@ -380,8 +329,6 @@ void HttpServer::main_loop(struct sockaddr_in *address, socklen_t *addrlen) {
 }
 
 void HttpServer::start() {
-    // pin_to_cpu_core(3); // Pin to CPU core 3 for performance
-
     struct sockaddr_in address;
     socklen_t addrlen = sizeof(address);
 
@@ -394,6 +341,7 @@ void HttpServer::start() {
 
     running = true;
 
+    // The main_loop now runs the non-blocking I/O multiplexer
     main_loop(&address, &addrlen);
 }
 
@@ -401,7 +349,11 @@ void HttpServer::stop() {
     running = false;
     if (server_fd != -1) {
         close(server_fd);
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, server_fd, nullptr);
         server_fd = -1;
+    }
+    if (thread_pool) {
+        thread_pool->shutdown();
     }
 }
 
